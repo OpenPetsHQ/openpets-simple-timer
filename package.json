@@ -1,7 +1,7 @@
 {
   "name": "openpets-simple-timer",
-  "version": "1.0.0",
-  "description": "OpenPets SDK v3 one-shot countdown timer plugin.",
+  "version": "1.1.0",
+  "description": "OpenPets SDK v3 countdown timer and stopwatch plugin.",
   "type": "module",
   "license": "MIT",
   "author": "Odunayo Balogun",

@@ -9,6 +9,7 @@ import {
   SNOOZE_MS,
   cleanLabel,
   durationForValues,
+  formatElapsed,
   formatRemaining,
   parseStoredTimer,
   register,
@@ -55,6 +56,21 @@ async function advanceTo(harness, scheduleId) {
   await harness.clock.advance(delta);
 }
 
+function installNow(initialMs) {
+  const nativeNow = Date.now;
+  let nowMs = initialMs;
+  Date.now = () => nowMs;
+  return {
+    now: () => nowMs,
+    add: (deltaMs) => {
+      nowMs += deltaMs;
+    },
+    restore: () => {
+      Date.now = nativeNow;
+    },
+  };
+}
+
 // Pure boundary helpers reject malformed input before it reaches timer logic.
 assert.deepEqual(PRESET_MINUTES, [5, 15, 25, 30, 60]);
 assert.equal(durationForValues({ preset: "15", customMinutes: 0 }), 15 * 60_000);
@@ -66,7 +82,12 @@ assert.equal(cleanLabel(" "), null);
 assert.equal(formatRemaining(0), "0:00");
 assert.equal(formatRemaining(65_000), "1:05");
 assert.equal(formatRemaining(3_661_000), "1:01:01");
+assert.equal(formatElapsed(0), "0:00");
+assert.equal(formatElapsed(65_999), "1:05");
+assert.equal(formatElapsed(3_661_000), "1:01:01");
 assert.equal(parseStoredTimer({ version: 1, timerId: "timer-a", label: null, startedAt: 1_000, durationMs: 60_000, phase: "running", endsAt: 61_000 }).phase, "running");
+assert.equal(parseStoredTimer({ version: 1, mode: "stopwatch", timerId: "watch-a", label: null, startedAt: 1_000, elapsedMs: 0, phase: "running" }).mode, "stopwatch");
+assert.equal(parseStoredTimer({ version: 1, mode: "stopwatch", timerId: "watch-b", label: null, startedAt: 1_000, elapsedMs: 30_000, phase: "paused" }).elapsedMs, 30_000);
 assert.equal(parseStoredTimer({ version: 1, timerId: "timer-b", label: null, startedAt: 1_000, durationMs: 60_000, phase: "running", endsAt: "61_000" }), null);
 assert.equal(parseStoredTimer({ version: 1, timerId: "timer-c", label: null, startedAt: 1_000, durationMs: 60_000, phase: "paused", remainingMs: 60_001 }), null);
 
@@ -276,7 +297,7 @@ assert.equal(parseStoredTimer({ version: 1, timerId: "timer-c", label: null, sta
   await h.ctx.storage.set("timer", { phase: "running", endsAt: "not-a-number" });
   await h.start();
   assert.equal(h.calls.schedules.size, 0);
-  assert.equal(h.calls.commands.size, 10);
+  assert.equal(h.calls.commands.size, 14);
   await h.stop();
   assert.equal(h.calls.schedules.size, 0);
   assert.equal(h.calls.commands.size, 0);
@@ -295,6 +316,108 @@ assert.equal(parseStoredTimer({ version: 1, timerId: "timer-c", label: null, sta
   assert.equal(h.calls.commands.size, 0);
   assert.equal(h.calls.bubbles.at(-1)?.dismissed, true);
   h.expectNoErrors();
+}
+
+// 10) Stopwatch start, HUD elapsed time, pause/resume, and reset use the same
+// absolute-time lifecycle while leaving the countdown schedules untouched.
+{
+  const time = installNow(1_800_000_000_000);
+  let h;
+  try {
+    h = createTestHarness(register, options(time.now()));
+    await h.start();
+    assert.ok(h.calls.commands.has("start-stopwatch"));
+    assert.ok(h.calls.commands.has("pause-resume-stopwatch"));
+    assert.ok(h.calls.commands.has("reset-stopwatch"));
+    await h.runCommand("start-stopwatch", { label: "Focus" });
+    h.expectStored("timer", (value) => value.mode === "stopwatch" && value.phase === "running" && value.elapsedMs === 0 && value.label === "Focus");
+    assert.equal(h.calls.schedules.size, 1, "a running stopwatch only needs the HUD refresh schedule");
+    const hud = h.calls.bubbles.at(-1);
+    assert.deepEqual(hud?.spec.actions?.map((action) => action.id), ["toggle", "reset"]);
+    assert.match(hud?.spec.hud?.items[0]?.label ?? "", /0:00 elapsed/);
+
+    time.add(60_000);
+    await h.clock.advance("60s");
+    assert.match(hud.spec.hud.items[0].label, /1:00 elapsed/);
+
+    time.add(30_000);
+    await h.clock.advance("30s");
+    await h.fireBubbleAction(hud.handle.id, "toggle");
+    h.expectStored("timer", (value) => value.mode === "stopwatch" && value.phase === "paused" && value.elapsedMs === 90_000);
+    assert.equal(h.calls.schedules.size, 0, "a paused stopwatch has no live schedules");
+
+    time.add(120_000);
+    await h.clock.advance("120s");
+    assert.equal(h.calls.storage.get("timer").elapsedMs, 90_000, "pausing freezes elapsed time");
+    await h.fireBubbleAction(hud.handle.id, "toggle");
+    h.expectStored("timer", (value) => value.mode === "stopwatch" && value.phase === "running" && value.startedAt === time.now() && value.elapsedMs === 90_000);
+    assert.equal(h.calls.schedules.size, 1);
+
+    await h.runCommand("reset-stopwatch");
+    assert.equal(h.calls.storage.has("timer"), false, "reset clears the stopwatch state");
+    assert.equal(h.calls.schedules.size, 0, "reset cancels the HUD refresh");
+    assert.equal(hud.dismissed, true, "reset dismisses the pinned HUD");
+    h.expectNoErrors();
+  } finally {
+    if (h) await h.stop();
+    time.restore();
+  }
+}
+
+// 11) A running stopwatch survives restart and recomputes elapsed time from
+// its absolute segment start, without inventing an expiry or duplicate alert.
+{
+  const time = installNow(1_800_100_000_000);
+  let h;
+  try {
+    h = createTestHarness(register, options(time.now()));
+    await h.ctx.storage.set("timer", {
+      version: 1,
+      mode: "stopwatch",
+      timerId: "watch-restart",
+      label: "Recovered",
+      startedAt: time.now() - 120_000,
+      elapsedMs: 30_000,
+      phase: "running",
+    });
+    await h.start();
+    assert.equal(h.calls.alerts.length, 0);
+    assert.equal(h.calls.schedules.size, 1, "restart restores only the stopwatch HUD schedule");
+    assert.equal(h.calls.schedules.has(EXPIRY_SCHEDULE_ID), false);
+    assert.match(h.calls.bubbles.at(-1)?.spec.hud?.items[0]?.label ?? "", /2:30 elapsed/);
+
+    await h.stop();
+    await h.start();
+    assert.equal(h.calls.alerts.length, 0, "restart does not create a stopwatch expiry alert");
+    assert.equal(h.calls.schedules.size, 1);
+    time.add(60_000);
+    await h.clock.advance("60s");
+    assert.match(h.calls.bubbles.at(-1)?.spec.hud?.items[0]?.label ?? "", /3:30 elapsed/);
+    h.expectNoErrors();
+  } finally {
+    if (h) await h.stop();
+    time.restore();
+  }
+}
+
+// 12) Stopwatch cleanup unregisters its commands, cancels its refresh, and
+// dismisses the pinned HUD just like an active countdown.
+{
+  const time = installNow(1_800_200_000_000);
+  let h;
+  try {
+    h = createTestHarness(register, options(time.now()));
+    await h.start();
+    await h.runCommand("start-stopwatch");
+    const hud = h.calls.bubbles.at(-1);
+    assert.equal(h.calls.schedules.size, 1);
+    await h.stop();
+    assert.equal(h.calls.schedules.size, 0);
+    assert.equal(h.calls.commands.size, 0);
+    assert.equal(hud.dismissed, true);
+  } finally {
+    time.restore();
+  }
 }
 
 assert.equal(MAX_DURATION_MS, 24 * 60 * 60_000);
