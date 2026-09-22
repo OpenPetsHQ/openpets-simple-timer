@@ -30,6 +30,10 @@ const COMMAND_IDS = [
   "add-five-minutes",
   "cancel-timer",
   "show-timer",
+  "start-stopwatch",
+  "pause-resume-stopwatch",
+  "reset-stopwatch",
+  "show-stopwatch",
 ];
 
 const contextStates = new WeakMap();
@@ -45,6 +49,10 @@ function isFiniteInteger(value) {
 
 function isPositiveInteger(value) {
   return isFiniteInteger(value) && value > 0;
+}
+
+function isNonNegativeInteger(value) {
+  return isFiniteInteger(value) && value >= 0;
 }
 
 function numericInteger(value) {
@@ -82,13 +90,39 @@ export function formatRemaining(remainingMs) {
   return hours > 0 ? `${hours}:${paddedMinutes}:${paddedSeconds}` : `${minutes}:${paddedSeconds}`;
 }
 
-/** Parse untrusted persisted data into one of the three timer states. */
+/** Format elapsed stopwatch time without counting a partial second twice. */
+export function formatElapsed(elapsedMs) {
+  const totalSeconds = Math.max(0, Math.floor(Number(elapsedMs) / 1_000));
+  const hours = Math.floor(totalSeconds / 3_600);
+  const minutes = Math.floor((totalSeconds % 3_600) / 60);
+  const seconds = totalSeconds % 60;
+  const paddedMinutes = String(minutes).padStart(2, "0");
+  const paddedSeconds = String(seconds).padStart(2, "0");
+  return hours > 0 ? `${hours}:${paddedMinutes}:${paddedSeconds}` : `${minutes}:${paddedSeconds}`;
+}
+
+/** Parse untrusted persisted data into a countdown or stopwatch state. */
 export function parseStoredTimer(value) {
   if (!isRecord(value) || value.version !== STORAGE_VERSION || typeof value.timerId !== "string" || value.timerId.length === 0) return null;
-  if (!isPositiveInteger(value.startedAt) || !isPositiveInteger(value.durationMs) || value.durationMs > MAX_DURATION_MS) return null;
   if (value.label !== null && typeof value.label !== "string") return null;
+  const mode = value.mode ?? "countdown";
+  if (mode === "stopwatch") {
+    if (!isPositiveInteger(value.startedAt) || !isNonNegativeInteger(value.elapsedMs)) return null;
+    if (value.phase !== "running" && value.phase !== "paused") return null;
+    return {
+      version: STORAGE_VERSION,
+      mode,
+      timerId: value.timerId,
+      label: cleanLabel(value.label),
+      startedAt: value.startedAt,
+      phase: value.phase,
+      elapsedMs: value.elapsedMs,
+    };
+  }
+  if (mode !== "countdown" || !isPositiveInteger(value.startedAt) || !isPositiveInteger(value.durationMs) || value.durationMs > MAX_DURATION_MS) return null;
   const common = {
     version: STORAGE_VERSION,
+    mode: "countdown",
     timerId: value.timerId,
     label: cleanLabel(value.label),
     startedAt: value.startedAt,
@@ -148,6 +182,12 @@ function isCurrent(ctx, token) {
   return Boolean(state && !state.stopped && state.generation === token);
 }
 
+function stopwatchElapsedMs(timer, now = Date.now()) {
+  if (!timer || timer.mode !== "stopwatch") return 0;
+  if (timer.phase === "paused") return timer.elapsedMs;
+  return timer.elapsedMs + Math.max(0, now - timer.startedAt);
+}
+
 function enqueue(ctx, operation) {
   const state = stateFor(ctx);
   const previous = state.queue;
@@ -195,6 +235,12 @@ async function updateStatus(ctx, timer, token) {
     await ctx.status.set({ text: ctx.t("status.expired", { label }), tone: "warning" });
     return;
   }
+  if (timer.mode === "stopwatch") {
+    const elapsed = formatElapsed(stopwatchElapsedMs(timer));
+    const key = timer.phase === "paused" ? "status.stopwatchPaused" : "status.stopwatchRunning";
+    await ctx.status.set({ text: ctx.t(key, { label, elapsed }), tone: timer.phase === "paused" ? "warning" : "info" });
+    return;
+  }
   const remaining = timer.phase === "paused" ? timer.remainingMs : Math.max(0, timer.endsAt - Date.now());
   const key = timer.phase === "paused" ? "status.paused" : "status.running";
   await ctx.status.set({ text: ctx.t(key, { label, remaining: formatRemaining(remaining) }), tone: timer.phase === "paused" ? "warning" : "info" });
@@ -240,21 +286,43 @@ async function dismissAlert(ctx, token) {
 
 function remainingMs(timer, now = Date.now()) {
   if (!timer) return 0;
+  if (timer.mode === "stopwatch") return 0;
   if (timer.phase === "paused") return timer.remainingMs;
   if (timer.phase === "expired") return 0;
   return Math.max(0, timer.endsAt - now);
 }
 
 function progressValue(timer, now = Date.now()) {
-  if (!timer || timer.phase === "expired") return 0;
+  if (!timer || timer.mode === "stopwatch" || timer.phase === "expired") return 0;
   const remaining = remainingMs(timer, now);
   return Math.max(0, Math.min(100, Math.round((1 - remaining / timer.durationMs) * 100)));
 }
 
 function hudSpec(ctx, timer) {
   const label = timer.label ?? ctx.t("timer.defaultLabel");
-  const remaining = formatRemaining(remainingMs(timer));
   const paused = timer.phase === "paused";
+  if (timer.mode === "stopwatch") {
+    const elapsed = formatElapsed(stopwatchElapsedMs(timer));
+    return {
+      hud: {
+        items: [{
+          icon: "timer",
+          value: 0,
+          label: ctx.t(paused ? "hud.stopwatchPaused" : "hud.stopwatchRunning", { label, elapsed }),
+          tone: paused ? "amber" : "blue",
+        }],
+      },
+      tone: paused ? "warning" : "info",
+      sticky: true,
+      pin: true,
+      priority: "normal",
+      actions: [
+        { id: "toggle", label: ctx.t(paused ? "action.resume" : "action.pause"), style: "primary", dismissesBubble: false },
+        { id: "reset", label: ctx.t("action.reset"), style: "danger" },
+      ],
+    };
+  }
+  const remaining = formatRemaining(remainingMs(timer));
   return {
     hud: {
       items: [{
@@ -320,7 +388,7 @@ async function updateHud(ctx, timer, token, { create = true } = {}) {
 async function scheduleExpiry(ctx, timer, token) {
   if (!isCurrent(ctx, token)) return;
   await ctx.schedule.cancel(EXPIRY_SCHEDULE_ID);
-  if (!isCurrent(ctx, token) || timer.phase !== "running") return;
+  if (!isCurrent(ctx, token) || timer.mode === "stopwatch" || timer.phase !== "running") return;
   await ctx.schedule.at(EXPIRY_SCHEDULE_ID, new Date(timer.endsAt).toISOString(), () => expireTimer(ctx, timer.timerId, token));
   if (!isCurrent(ctx, token)) await ctx.schedule.cancel(EXPIRY_SCHEDULE_ID);
 }
@@ -401,7 +469,7 @@ async function showExpiryAlert(ctx, timer, token) {
 
 async function expireTimerImpl(ctx, timerId, token, { scheduled = false } = {}) {
   const timer = await readTimer(ctx);
-  if (!isCurrent(ctx, token) || !timer || timer.timerId !== timerId || timer.phase !== "running") return false;
+  if (!isCurrent(ctx, token) || !timer || timer.mode === "stopwatch" || timer.timerId !== timerId || timer.phase !== "running") return false;
   if (!scheduled && timer.endsAt > Date.now()) {
     await scheduleExpiry(ctx, timer, token);
     await scheduleHudRefresh(ctx, timer, token);
@@ -411,6 +479,7 @@ async function expireTimerImpl(ctx, timerId, token, { scheduled = false } = {}) 
   if (!isCurrent(ctx, token)) return false;
   const expired = {
     version: STORAGE_VERSION,
+    mode: "countdown",
     timerId: timer.timerId,
     label: timer.label,
     startedAt: timer.startedAt,
@@ -439,7 +508,7 @@ async function refreshHudImpl(ctx, timerId, token) {
     await updateHud(ctx, null, token);
     return;
   }
-  if (timer.phase === "running" && timer.endsAt <= Date.now()) {
+  if (timer.mode === "countdown" && timer.phase === "running" && timer.endsAt <= Date.now()) {
     await expireTimerImpl(ctx, timerId, token, { scheduled: true });
     return;
   }
@@ -458,12 +527,28 @@ function makeRunningTimer(ctx, durationMs, label) {
   const now = Date.now();
   return {
     version: STORAGE_VERSION,
+    mode: "countdown",
     timerId: `timer-${now.toString(36)}-${state.sequence.toString(36)}`,
     label: cleanLabel(label),
     startedAt: now,
     durationMs,
     phase: "running",
     endsAt: now + durationMs,
+  };
+}
+
+function makeRunningStopwatch(ctx, label) {
+  const state = stateFor(ctx);
+  state.sequence += 1;
+  const now = Date.now();
+  return {
+    version: STORAGE_VERSION,
+    mode: "stopwatch",
+    timerId: `stopwatch-${now.toString(36)}-${state.sequence.toString(36)}`,
+    label: cleanLabel(label),
+    startedAt: now,
+    phase: "running",
+    elapsedMs: 0,
   };
 }
 
@@ -490,6 +575,25 @@ export function startTimer(ctx, durationMs, label) {
   return lifecycle(ctx, (token) => startTimerImpl(ctx, durationMs, label, token));
 }
 
+async function startStopwatchImpl(ctx, label, token) {
+  const stopwatch = makeRunningStopwatch(ctx, label);
+  await cancelSchedules(ctx, token);
+  if (!isCurrent(ctx, token)) return undefined;
+  await dismissHud(ctx, token);
+  if (!isCurrent(ctx, token)) return undefined;
+  await dismissAlert(ctx, token);
+  if (!isCurrent(ctx, token)) return undefined;
+  await saveTimer(ctx, stopwatch, token);
+  if (!isCurrent(ctx, token)) return undefined;
+  await scheduleHudRefresh(ctx, stopwatch, token);
+  await updateHud(ctx, stopwatch, token);
+  return stopwatch;
+}
+
+export function startStopwatch(ctx, label) {
+  return lifecycle(ctx, (token) => startStopwatchImpl(ctx, label, token));
+}
+
 async function togglePauseImpl(ctx, token) {
   const timer = await readTimer(ctx);
   if (!isCurrent(ctx, token)) return;
@@ -497,7 +601,22 @@ async function togglePauseImpl(ctx, token) {
     await ctx.pet.speak(ctx.t("speech.none"));
     return;
   }
-  if (timer.phase === "running" && timer.endsAt <= Date.now()) {
+  if (timer.mode === "stopwatch") {
+    await cancelSchedules(ctx, token);
+    if (!isCurrent(ctx, token)) return;
+    if (timer.phase === "running") {
+      const paused = { ...timer, phase: "paused", elapsedMs: stopwatchElapsedMs(timer) };
+      await saveTimer(ctx, paused, token);
+      await updateHud(ctx, paused, token);
+      return;
+    }
+    const resumed = { ...timer, phase: "running", startedAt: Date.now() };
+    await saveTimer(ctx, resumed, token);
+    await scheduleHudRefresh(ctx, resumed, token);
+    await updateHud(ctx, resumed, token);
+    return;
+  }
+  if (timer.mode === "countdown" && timer.phase === "running" && timer.endsAt <= Date.now()) {
     await expireTimerImpl(ctx, timer.timerId, token, { scheduled: true });
     return;
   }
@@ -522,6 +641,20 @@ export function pauseOrResume(ctx, expectedToken) {
   return lifecycle(ctx, (token) => togglePauseImpl(ctx, token), expectedToken);
 }
 
+async function pauseOrResumeStopwatchImpl(ctx, token) {
+  const timer = await readTimer(ctx);
+  if (!isCurrent(ctx, token)) return;
+  if (!timer || timer.mode !== "stopwatch") {
+    await ctx.pet.speak(ctx.t("speech.noStopwatch"));
+    return;
+  }
+  await togglePauseImpl(ctx, token);
+}
+
+export function pauseOrResumeStopwatch(ctx, expectedToken) {
+  return lifecycle(ctx, (token) => pauseOrResumeStopwatchImpl(ctx, token), expectedToken);
+}
+
 async function addFiveImpl(ctx, token) {
   const timer = await readTimer(ctx);
   if (!isCurrent(ctx, token)) return;
@@ -529,7 +662,11 @@ async function addFiveImpl(ctx, token) {
     await ctx.pet.speak(ctx.t("speech.none"));
     return;
   }
-  if (timer.phase === "running" && timer.endsAt <= Date.now()) {
+  if (timer.mode === "stopwatch") {
+    await ctx.pet.speak(ctx.t("speech.countdownOnly"));
+    return;
+  }
+  if (timer.mode === "countdown" && timer.phase === "running" && timer.endsAt <= Date.now()) {
     await expireTimerImpl(ctx, timer.timerId, token, { scheduled: true });
     return;
   }
@@ -568,6 +705,20 @@ async function clearTimerImpl(ctx, token) {
 
 export function cancelTimer(ctx, expectedToken) {
   return lifecycle(ctx, (token) => clearTimerImpl(ctx, token), expectedToken);
+}
+
+async function resetStopwatchImpl(ctx, token) {
+  const timer = await readTimer(ctx);
+  if (!isCurrent(ctx, token)) return;
+  if (!timer || timer.mode !== "stopwatch") {
+    await ctx.pet.speak(ctx.t("speech.noStopwatch"));
+    return;
+  }
+  await clearTimerImpl(ctx, token);
+}
+
+export function resetStopwatch(ctx, expectedToken) {
+  return lifecycle(ctx, (token) => resetStopwatchImpl(ctx, token), expectedToken);
 }
 
 async function snoozeExpiredImpl(ctx, timerId, token) {
@@ -609,14 +760,14 @@ async function reconcileImpl(ctx, token) {
     await updateStatus(ctx, null, token);
     return;
   }
-  if (timer.phase === "running" && timer.endsAt <= Date.now()) {
+  if (timer.mode === "countdown" && timer.phase === "running" && timer.endsAt <= Date.now()) {
     await expireTimerImpl(ctx, timer.timerId, token, { scheduled: true });
     return;
   }
   await updateStatus(ctx, timer, token);
   await updateHud(ctx, timer, token);
   if (timer.phase === "running") {
-    await scheduleExpiry(ctx, timer, token);
+    if (timer.mode === "countdown") await scheduleExpiry(ctx, timer, token);
     await scheduleHudRefresh(ctx, timer, token);
   } else if (timer.phase === "expired" && timer.alertShownAt === null) {
     await showExpiryAlert(ctx, timer, token);
@@ -650,8 +801,24 @@ export function showTimer(ctx) {
   return lifecycle(ctx, (token) => showTimerImpl(ctx, token));
 }
 
+async function showStopwatchImpl(ctx, token) {
+  const timer = await readTimer(ctx);
+  if (!isCurrent(ctx, token)) return;
+  if (!timer || timer.mode !== "stopwatch") {
+    await ctx.pet.speak(ctx.t("speech.noStopwatch"));
+    return;
+  }
+  await updateStatus(ctx, timer, token);
+  await updateHud(ctx, timer, token);
+}
+
+export function showStopwatch(ctx) {
+  return lifecycle(ctx, (token) => showStopwatchImpl(ctx, token));
+}
+
 async function handleHudAction(ctx, actionId) {
   if (actionId === "toggle") return pauseOrResume(ctx);
+  if (actionId === "reset") return resetStopwatch(ctx);
   if (actionId === "add-5") return addFiveMinutes(ctx);
   if (actionId === "cancel") return cancelTimer(ctx);
 }
@@ -685,6 +852,20 @@ function commandForm() {
   };
 }
 
+function stopwatchForm() {
+  return {
+    submitLabel: "$t:command.stopwatch.start.submit",
+    fields: [
+      {
+        id: "label",
+        type: "text",
+        label: "$t:form.label.label",
+        maxLength: MAX_LABEL_LENGTH,
+      },
+    ],
+  };
+}
+
 async function startFromValues(ctx, values = {}) {
   const durationMs = durationForValues(values);
   if (durationMs === null) {
@@ -692,6 +873,10 @@ async function startFromValues(ctx, values = {}) {
     return;
   }
   await startTimer(ctx, durationMs, values.label);
+}
+
+async function startStopwatchFromValues(ctx, values = {}) {
+  await startStopwatch(ctx, values.label);
 }
 
 async function stopContext(ctx) {
@@ -733,6 +918,7 @@ export function register(OpenPetsPlugin) {
       activateContext(ctx);
       await reconcile(ctx);
       await ctx.commands.register({ id: "start-timer", title: "$t:command.start.title", description: "$t:command.start.description", icon: "timer", form: commandForm(), placement: "top", featured: true }, (values) => startFromValues(ctx, values));
+      await ctx.commands.register({ id: "start-stopwatch", title: "$t:command.stopwatch.start.title", description: "$t:command.stopwatch.start.description", icon: "timer", form: stopwatchForm() }, (values) => startStopwatchFromValues(ctx, values));
       for (const minutes of PRESET_MINUTES) {
         await ctx.commands.register({
           id: `timer-${minutes}`,
@@ -742,9 +928,12 @@ export function register(OpenPetsPlugin) {
         }, () => startTimer(ctx, minutes * 60_000));
       }
       await ctx.commands.register({ id: "pause-resume-timer", title: "$t:command.pauseResume.title", description: "$t:command.pauseResume.description", icon: "timer" }, () => pauseOrResume(ctx));
+      await ctx.commands.register({ id: "pause-resume-stopwatch", title: "$t:command.stopwatch.pauseResume.title", description: "$t:command.stopwatch.pauseResume.description", icon: "timer" }, () => pauseOrResumeStopwatch(ctx));
       await ctx.commands.register({ id: "add-five-minutes", title: "$t:command.addFive.title", description: "$t:command.addFive.description", icon: "timer" }, () => addFiveMinutes(ctx));
       await ctx.commands.register({ id: "cancel-timer", title: "$t:command.cancel.title", description: "$t:command.cancel.description", icon: "timer" }, () => cancelTimer(ctx));
       await ctx.commands.register({ id: "show-timer", title: "$t:command.show.title", description: "$t:command.show.description", icon: "timer" }, () => showTimer(ctx));
+      await ctx.commands.register({ id: "reset-stopwatch", title: "$t:command.stopwatch.reset.title", description: "$t:command.stopwatch.reset.description", icon: "timer" }, () => resetStopwatch(ctx));
+      await ctx.commands.register({ id: "show-stopwatch", title: "$t:command.stopwatch.show.title", description: "$t:command.stopwatch.show.description", icon: "timer" }, () => showStopwatch(ctx));
     },
     async stop() {
       await Promise.all([...activeContexts].map((ctx) => stopContext(ctx)));

@@ -1,14 +1,18 @@
 # Simple Timer
 
-An OpenPets SDK v3 plugin for one-shot countdowns with preset or custom
-durations, an optional label, a pinned pet HUD, pause/resume, cancel, +5
-minutes, and an expiry alert with snooze or dismiss.
+An OpenPets SDK v3 plugin for one-shot countdowns and elapsed-time stopwatches.
+Countdowns support preset or custom durations, an optional label, a pinned pet
+HUD, pause/resume, cancel, +5 minutes, and an expiry alert with snooze or
+dismiss. Stopwatches support start, pause/resume, reset, an optional label, and
+a pinned elapsed-time HUD.
 
 The alert can optionally play a sound and request an OS notification. The
 plugin stores absolute timestamps and reconciles them on startup, so sleep and
-restart do not turn a countdown into a duplicate or stale callback. If both
-alert presentation paths fail, the expiry remains pending for a later lifecycle
-recovery instead of being marked delivered.
+restart do not turn a countdown into a duplicate or stale callback. Stopwatch
+records store an absolute start of the current run plus accumulated elapsed
+time, so pause/resume and restart do not depend on an in-memory interval. If
+both alert presentation paths fail, the expiry remains pending for a later
+lifecycle recovery instead of being marked delivered.
 
 Plugin id: `openpets.simple-timer`.
 
