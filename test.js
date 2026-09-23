@@ -326,6 +326,16 @@ assert.equal(parseStoredTimer({ version: 1, timerId: "timer-c", label: null, sta
   try {
     h = createTestHarness(register, options(time.now()));
     await h.start();
+    const startTimerCommand = h.calls.commands.get("start-timer")?.meta;
+    assert.equal(startTimerCommand?.placement, "submenu", "Start Timer is explicitly registered for its plugin submenu");
+    assert.equal(startTimerCommand?.featured, undefined, "Start Timer is not promoted to the pet menu root");
+    assert.ok(startTimerCommand?.form, "Start Timer keeps its command form");
+    const startStopwatchCommand = h.calls.commands.get("start-stopwatch")?.meta;
+    assert.ok(startStopwatchCommand?.form, "Start Stopwatch keeps its command form");
+    for (const [commandId, { meta }] of h.calls.commands) {
+      assert.notEqual(meta.placement, "top", `${commandId} is not promoted above its plugin submenu`);
+      assert.notEqual(meta.featured, true, `${commandId} is not featured at the pet menu root`);
+    }
     assert.ok(h.calls.commands.has("start-stopwatch"));
     assert.ok(h.calls.commands.has("pause-resume-stopwatch"));
     assert.ok(h.calls.commands.has("reset-stopwatch"));
