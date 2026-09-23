@@ -917,7 +917,7 @@ export function register(OpenPetsPlugin) {
     async start(ctx) {
       activateContext(ctx);
       await reconcile(ctx);
-      await ctx.commands.register({ id: "start-timer", title: "$t:command.start.title", description: "$t:command.start.description", icon: "timer", form: commandForm(), placement: "top", featured: true }, (values) => startFromValues(ctx, values));
+      await ctx.commands.register({ id: "start-timer", title: "$t:command.start.title", description: "$t:command.start.description", icon: "timer", form: commandForm(), placement: "submenu" }, (values) => startFromValues(ctx, values));
       await ctx.commands.register({ id: "start-stopwatch", title: "$t:command.stopwatch.start.title", description: "$t:command.stopwatch.start.description", icon: "timer", form: stopwatchForm() }, (values) => startStopwatchFromValues(ctx, values));
       for (const minutes of PRESET_MINUTES) {
         await ctx.commands.register({
